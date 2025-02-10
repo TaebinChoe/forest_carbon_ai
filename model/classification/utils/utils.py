@@ -300,6 +300,7 @@ class TiffDataset(Dataset):
 
         return patch, label
 
+    
 #he initializer 함수
 def he_init_weights(m):
     """
