@@ -12,6 +12,7 @@ from sklearn.metrics import r2_score  # R² Score 계산
 import rasterio
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
+import torch.nn.init as init
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # device 설정
 
@@ -259,3 +260,27 @@ def visualize_result(result, title = 'Visualization'):
     plt.colorbar()
     plt.title(title)
     plt.show()
+
+#he initializer 함수
+def he_init_weights(m):
+    """
+    Applies He (Kaiming) initialization to Conv layers and Linear layers.
+    
+    - Conv2d, Conv3d: He Normal Initialization with fan_out mode
+    - Linear: He Uniform Initialization with fan_in mode
+    - BatchNorm: gamma = 1, beta = 0
+    - Biases (if exist): Initialized to zero
+    """
+    if isinstance(m, (nn.Conv2d, nn.Conv3d)):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+    
+    elif isinstance(m, nn.Linear):
+        init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+
+    elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+        init.constant_(m.weight, 1)
+        init.constant_(m.bias, 0)
