@@ -261,3 +261,158 @@ class VideoClassifier(nn.Module):
         # 최종 분류기 적용
         x = self.classifier(x.squeeze(-1).squeeze(-1).squeeze(-1))
         return x
+
+
+#(Token_length, embedding) = (12, 4×81)인 transformer 모델
+
+class TransformerModel(nn.Module):
+    def __init__(self, patch_size=9, num_bands=4, temp=12, num_classes=6, 
+                 d_model=64, nhead=4, num_layers=4, dim_feedforward=128, dropout=0.1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_bands = num_bands
+        self.temp = temp
+        self.num_tokens = temp  # 12개 (시계열 단위)
+        self.d_model = d_model  
+
+        # ** 입력 차원 변환 (4×9×9 → d_model) **
+        self.input_projection = nn.Linear(num_bands * patch_size * patch_size, d_model)
+
+        # Positional Encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_tokens, d_model))
+
+        # ** Layer Normalization 추가 **
+        self.norm1 = nn.LayerNorm(d_model)  
+
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead,  
+            dim_feedforward=dim_feedforward,  
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Classification Head (Dropout 추가)
+        self.fc = nn.Sequential(
+            nn.Linear(self.num_tokens * d_model, 128),  # 192 → 128
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),  # 96 → 64
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+        # ** Layer Normalization 추가 **
+        self.norm2 = nn.LayerNorm(num_classes)  
+
+        # ** 가중치 초기화 **
+        self.apply(self._init_weights)  
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+
+        # (batch, 4, 12, 9, 9) → (batch, 12, 4×9×9)
+        x = x.permute(0, 2, 1, 3, 4).reshape(batch_size, self.num_tokens, -1)
+
+        # 입력 차원 변환 (4×9×9 → d_model)
+        x = self.input_projection(x)
+
+        # Add Positional Encoding
+        x = x + self.pos_embedding  
+
+        # Transformer Encoder
+        x = self.norm1(x)  
+        x = self.transformer(x)  
+
+        # Flatten & Classification
+        x = x.flatten(1)  
+        x = self.fc(x)
+
+        # 출력 정규화
+        x = self.norm2(x)  
+
+        return x
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)  
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+#hybrid 모델            
+class HybridCNNTransformer(nn.Module):
+    def __init__(self, patch_size=9, num_bands=4, temp=12, num_classes=6, 
+                 d_model=64, nhead=4, num_layers=4, dim_feedforward=128, dropout=0.1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_bands = num_bands
+        self.temp = temp
+        self.num_tokens = temp  # 12개 (시계열 단위)
+        self.d_model = d_model  
+
+        # ** 2+1D CNN Feature Extractor **
+        self.cnn_feature_extractor = nn.Sequential(
+            nn.Conv3d(in_channels=num_bands, out_channels=32, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.ReLU(),
+            nn.Conv3d(in_channels=32, out_channels=d_model, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool3d((self.num_tokens, 1, 1))  # (B, d_model, 12, 1, 1)
+        )
+
+        # Positional Encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_tokens, d_model))
+
+        # Layer Normalization
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Classification Head
+        self.fc = nn.Sequential(
+            nn.Linear(self.num_tokens * d_model, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+        self.norm2 = nn.LayerNorm(num_classes)
+
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+
+        # CNN Feature Extraction (B, 4, 12, 9, 9) -> (B, d_model, 12, 1, 1)
+        x = self.cnn_feature_extractor(x)
+        x = x.squeeze(-1).squeeze(-1)  # (B, d_model, 12)
+        x = x.permute(0, 2, 1)  # (B, 12, d_model)
+
+        # Add Positional Encoding
+        x = x + self.pos_embedding
+
+        # Transformer Encoder
+        x = self.norm1(x)
+        x = self.transformer(x)
+
+        # Flatten & Classification
+        x = x.flatten(1)
+        x = self.fc(x)
+        x = self.norm2(x)
+
+        return x
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
