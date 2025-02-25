@@ -34,6 +34,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
             optimizer.zero_grad()
             outputs = model(images)
+            
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
