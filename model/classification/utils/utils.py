@@ -11,6 +11,7 @@ import seaborn as sns
 import copy
 import torch.nn as nn
 import torch.nn.init as init
+import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #device 설정
 
@@ -220,6 +221,79 @@ def evaluate_broadleaf_classification(all_labels, all_predictions):
     
     return pd.DataFrame(classification_report(true_labels, pred_labels, target_names=["Mongolian Oak", "Oriental Oak"], digits=3, output_dict=True)).transpose()
 
+#rf평가를 위함
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+# 클래스별 라벨 이름 정의
+target_name_mapping = {
+    0: "Non-Forest",  # 비산림
+    1: "Pine",  # 소나무
+    2: "Nut Pine",  # 잣나무
+    3: "Larch",  # 낙엽송
+    4: "Mongolian Oak",  # 신갈나무
+    5: "Oriental Oak"  # 굴참나무
+}
+
+# 모델 평가 함수
+def evaluate_rf_model_with_cm(model, val_loader, num_classes=6, target_name_mapping=target_name_mapping):
+    """
+    Random Forest 모델의 성능을 평가하고 혼동 행렬(Confusion Matrix) 및 분류 리포트를 생성하는 함수.
+    추가적으로 침엽수와 활엽수의 분류력 및 내부 분류력을 분석하고 이를 반환하는 데이터프레임에 포함한다.
+    """
+    all_labels = []
+    all_predictions = []
+
+    # 검증 데이터셋을 이용하여 모델 예측 수행
+    for X_batch, y_batch in tqdm(val_loader, desc="Evaluation Progress"):
+        X_batch = X_batch.numpy()  # NumPy로 변환 (RandomForest는 NumPy 배열을 사용)
+        y_batch = y_batch.numpy()
+        
+        # 예측
+        preds = model.predict(X_batch)  # RandomForest 예측
+
+        all_labels.extend(y_batch)
+        all_predictions.extend(preds)
+
+    # 전체 클래스 라벨 리스트 생성
+    full_class_labels = np.arange(num_classes)
+    cm = confusion_matrix(all_labels, all_predictions, labels=full_class_labels)
+    
+    # 전체 데이터에 대한 혼동 행렬 시각화
+    plt.figure(figsize=(10, 7))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=target_name_mapping.values(), yticklabels=target_name_mapping.values())
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+    plt.show()
+    
+    # 전체 데이터에 대한 분류 리포트
+    target_names = list(target_name_mapping.values())
+    report_dict = classification_report(all_labels, all_predictions, labels=full_class_labels, target_names=target_names, digits=3, output_dict=True)
+    report_df = pd.DataFrame(report_dict).transpose()
+    report_df["Category"] = "Overall"
+    
+    # 추가적인 분석 수행 및 결과 저장
+    conifer_vs_broadleaf_report = evaluate_conifer_vs_broadleaf(all_labels, all_predictions)  # 침/활 분류력
+    conifer_vs_broadleaf_report["Category"] = "Conifer vs Broadleaf"
+    
+    conifer_report = evaluate_conifer_classification(all_labels, all_predictions)  # 침엽수 내 분류력
+    conifer_report["Category"] = "Conifer"
+    
+    broadleaf_report = evaluate_broadleaf_classification(all_labels, all_predictions)  # 활엽수 내 분류력
+    broadleaf_report["Category"] = "Broadleaf"
+    
+    # 결과를 하나의 데이터프레임으로 통합
+    additional_metrics = pd.concat([conifer_vs_broadleaf_report, conifer_report, broadleaf_report])
+    final_report_df = pd.concat([report_df, additional_metrics])
+    
+    return final_report_df
+
+
 #dataset class
 class TiffDataset(Dataset):
     def __init__(self, large_tif_dir, file_list, label_file, patch_size=3, box_filter_fn=None, transform=None):
@@ -325,3 +399,95 @@ def he_init_weights(m):
     elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
         init.constant_(m.weight, 1)
         init.constant_(m.bias, 0)
+
+#sdi 함수
+def sdi_importance_analysis(model, data_loader, num_samples=1, perturbation_strength=0.2, target_dims=None):
+    model.eval()
+
+    sample_batch, _ = next(iter(data_loader))
+    num_dims = len(sample_batch.shape) - 1
+    dim_names = [f"dim_{i}" for i in range(1, num_dims + 1)]
+
+    # 조사할 차원을 설정 (기본: 모든 차원)
+    if target_dims is None:
+        target_dims = dim_names
+    else:
+        target_dims = [f"dim_{i}" for i in target_dims]
+
+    importance_scores = {dim: 0.0 for dim in target_dims}
+    per_class_scores = {}
+
+    num_batches = 0
+    for X_batch, _ in data_loader:
+        num_batches += 1
+        X_batch = X_batch.to(next(model.parameters()).device)
+
+        logit_original = model(X_batch).detach()
+        num_classes = logit_original.shape[1]
+
+        if not per_class_scores:
+            per_class_scores = {cls: {dim: 0.0 for dim in target_dims} for cls in range(num_classes)}
+
+        for dim_name in target_dims:
+            dim_idx = dim_names.index(dim_name) + 1  # 1-based index
+            total_mse = 0.0
+            class_mse = {cls: 0.0 for cls in range(num_classes)}
+
+            for _ in range(num_samples):
+                X_perturbed = X_batch.clone().detach()
+                num_swap = max(1, int(X_perturbed.shape[dim_idx] * perturbation_strength))
+                swap_indices = random.sample(range(X_perturbed.shape[dim_idx]), num_swap)
+                permutation = random.sample(swap_indices, len(swap_indices))
+
+                X_perturbed.index_copy_(dim_idx, torch.tensor(swap_indices, device=X_batch.device),
+                                        X_perturbed.index_select(dim_idx, torch.tensor(permutation, device=X_batch.device)))
+
+                logit_perturbed = model(X_perturbed).detach()
+                mse = torch.mean((logit_original - logit_perturbed) ** 2, dim=0)
+                total_mse += mse.mean().item()
+
+                for cls in range(num_classes):
+                    class_mse[cls] += mse[cls].item()
+
+            importance_scores[dim_name] += total_mse / num_samples
+            for cls in range(num_classes):
+                per_class_scores[cls][dim_name] += class_mse[cls] / num_samples
+
+    for key in importance_scores:
+        importance_scores[key] /= num_batches
+
+    for cls in per_class_scores:
+        for key in per_class_scores[cls]:
+            per_class_scores[cls][key] /= num_batches
+
+    # 🔹 선택한 차원만 정규화하여 합이 1이 되도록 조정
+    total_score = sum(importance_scores.values())
+    importance_scores = {key: value / total_score for key, value in importance_scores.items()} if total_score > 0 else importance_scores
+
+    for cls in per_class_scores:
+        class_total_score = sum(per_class_scores[cls].values())
+        per_class_scores[cls] = {key: value / class_total_score for key, value in per_class_scores[cls].items()} if class_total_score > 0 else per_class_scores[cls]
+
+    return {"overall": importance_scores, "per_class": per_class_scores}
+
+
+def plot_importance_scores(importance_scores, per_class_scores):
+    # Overall Dimension Importance (Bar Chart)
+    plt.figure(figsize=(8, 5))
+    plt.bar(importance_scores.keys(), importance_scores.values(), color='skyblue')
+    plt.xlabel("Dimension")
+    plt.ylabel("Importance Score")
+    plt.title("Overall Dimension Importance")
+    plt.xticks(rotation=45)
+    plt.show()
+
+    # Per-Class Importance (Heatmap)
+    per_class_df = {cls: list(scores.values()) for cls, scores in per_class_scores.items()}
+    dim_labels = list(per_class_scores[0].keys())  # Dimension names
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(list(per_class_df.values()), annot=True, cmap="Blues", xticklabels=dim_labels, yticklabels=list(per_class_df.keys()))
+    plt.xlabel("Dimension")
+    plt.ylabel("Class")
+    plt.title("Per-Class Dimension Importance")
+    plt.show()
