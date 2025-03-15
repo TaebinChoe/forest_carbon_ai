@@ -70,7 +70,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_loss = train_running_loss / len(train_loader.dataset)  # 전체 샘플 수로 나눔
         train_losses.append(train_loss)
         
-        full_class_labels = np.arange(outputs.shape[1])
+        #full_class_labels = np.arange(outputs.shape[1])
+        full_class_labels = np.arange(6)
         train_report = classification_report(train_labels, train_predictions, labels=full_class_labels, output_dict=True)
 
         # Validation Phase
