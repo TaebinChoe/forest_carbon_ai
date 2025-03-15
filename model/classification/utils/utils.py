@@ -5,6 +5,7 @@ import os
 import torch
 import tifffile as tiff
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
@@ -12,11 +13,30 @@ import copy
 import torch.nn as nn
 import torch.nn.init as init
 import random
+from torchvision import transforms
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #device 설정
 
-#train 함수
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, patience=10):
+target_name_mapping = {
+    0: "NF", #Non-Forest, 비산림
+    1: "PD", # Pinus densiflora, 소나무
+    2: "PK", # Pinus koraiensis, 잣나무
+    3: "LK", # Larix kaempferi, 낙엽송
+    4: "QM", # Quercus mongolica, 신갈나무
+    5: "QV" # Quercus variabilis, 굴참나무
+}
+
+# 날짜 라벨 설정
+dates = ['0201', '0301', '0401', '0415', '0501', '0515', '0601', '0701', '0901', '1001', '1015', '1101']
+
+"""
+모델 학습 함수
+"""
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, scheduler=None, patience = None):
+    
+    if patience == None:
+        patience= num_epochs
+        
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -74,7 +94,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f"\nEpoch [{epoch+1}/{num_epochs}], "
               f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.2f}%, "
               f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%\n")
-
+        
         # Early Stopping & Model Saving
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -86,22 +106,18 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         if no_improve_count >= patience:
             print("Early stopping triggered. Training stopped.")
             break
+            
+        if scheduler:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)  # validation loss 기준
+            else:
+                scheduler.step()  # 일반적인 step()
     
     return best_model_state, train_losses, val_losses
 
-#eval함수
-
-# 클래스별 라벨 이름 정의
-target_name_mapping = {
-    0: "Non-Forest",  # 비산림
-    1: "Pine",  # 소나무
-    2: "Nut Pine",  # 잣나무
-    3: "Larch",  # 낙엽송
-    4: "Mongolian Oak",  # 신갈나무
-    5: "Oriental Oak"  # 굴참나무
-}
-
-# 모델 평가 함수
+"""
+모델 평가를 위한 함수들
+"""
 def evaluate_model_with_cm(model, val_loader, num_classes=6, target_name_mapping=target_name_mapping):
     """
     모델의 성능을 평가하고 혼동 행렬(Confusion Matrix) 및 분류 리포트를 생성하는 함수.
@@ -136,17 +152,17 @@ def evaluate_model_with_cm(model, val_loader, num_classes=6, target_name_mapping
     target_names = list(target_name_mapping.values())
     report_dict = classification_report(all_labels, all_predictions, labels=full_class_labels, target_names=target_names, digits=3, output_dict=True)
     report_df = pd.DataFrame(report_dict).transpose()
-    report_df["Category"] = "Overall"
+    report_df["task"] = "Overall"
     
     # 추가적인 분석 수행 및 결과 저장
     conifer_vs_broadleaf_report = evaluate_conifer_vs_broadleaf(all_labels, all_predictions) #침/활 분류력
-    conifer_vs_broadleaf_report["Category"] = "Conifer vs Broadleaf"
+    conifer_vs_broadleaf_report["task"] = "Conifer vs Broadleaf"
     
     conifer_report = evaluate_conifer_classification(all_labels, all_predictions) #침엽수 내 분류력
-    conifer_report["Category"] = "Conifer"
+    conifer_report["task"] = "Conifer"
     
     broadleaf_report = evaluate_broadleaf_classification(all_labels, all_predictions) #활엽수 내 분류력
-    broadleaf_report["Category"] = "Broadleaf"
+    broadleaf_report["task"] = "Broadleaf"
     
     # 결과를 하나의 데이터프레임으로 통합
     additional_metrics = pd.concat([conifer_vs_broadleaf_report, conifer_report, broadleaf_report])
@@ -190,15 +206,16 @@ def evaluate_conifer_classification(all_labels, all_predictions):
     pred_labels = [all_predictions[i] for i in valid_indices]
     
     cm = confusion_matrix(true_labels, pred_labels, labels=[1, 2, 3])
+    target_names = [target_name_mapping[1], target_name_mapping[2], target_name_mapping[3]]
     
     plt.figure(figsize=(7, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["Pine", "Nut Pine", "Larch"], yticklabels=["Pine", "Nut Pine", "Larch"])
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=target_names, yticklabels=target_names)
     plt.xlabel('Predicted Labels')
     plt.ylabel('True Labels')
     plt.title('Conifer Classification')
     plt.show()
     
-    return pd.DataFrame(classification_report(true_labels, pred_labels, target_names=["Pine", "Nut Pine", "Larch"], digits=3, output_dict=True)).transpose()
+    return pd.DataFrame(classification_report(true_labels, pred_labels, target_names=target_names, digits=3, output_dict=True)).transpose()
 
 # 활엽수 내부 분류력 평가 함수
 def evaluate_broadleaf_classification(all_labels, all_predictions):
@@ -211,35 +228,18 @@ def evaluate_broadleaf_classification(all_labels, all_predictions):
     pred_labels = [all_predictions[i] for i in valid_indices]
     
     cm = confusion_matrix(true_labels, pred_labels, labels=[4, 5])
+    target_names = [target_name_mapping[4], target_name_mapping[5]]
     
     plt.figure(figsize=(7, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["Mongolian Oak", "Oriental Oak"], yticklabels=["Mongolian Oak", "Oriental Oak"])
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=target_names, yticklabels=target_names)
     plt.xlabel('Predicted Labels')
     plt.ylabel('True Labels')
     plt.title('Broadleaf Classification')
     plt.show()
     
-    return pd.DataFrame(classification_report(true_labels, pred_labels, target_names=["Mongolian Oak", "Oriental Oak"], digits=3, output_dict=True)).transpose()
+    return pd.DataFrame(classification_report(true_labels, pred_labels, target_names=target_names, digits=3, output_dict=True)).transpose()
 
-#rf평가를 위함
-from sklearn.metrics import confusion_matrix, classification_report
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-
-# 클래스별 라벨 이름 정의
-target_name_mapping = {
-    0: "Non-Forest",  # 비산림
-    1: "Pine",  # 소나무
-    2: "Nut Pine",  # 잣나무
-    3: "Larch",  # 낙엽송
-    4: "Mongolian Oak",  # 신갈나무
-    5: "Oriental Oak"  # 굴참나무
-}
-
-# 모델 평가 함수
+#rf평가를 위한 함수
 def evaluate_rf_model_with_cm(model, val_loader, num_classes=6, target_name_mapping=target_name_mapping):
     """
     Random Forest 모델의 성능을 평가하고 혼동 행렬(Confusion Matrix) 및 분류 리포트를 생성하는 함수.
@@ -275,17 +275,17 @@ def evaluate_rf_model_with_cm(model, val_loader, num_classes=6, target_name_mapp
     target_names = list(target_name_mapping.values())
     report_dict = classification_report(all_labels, all_predictions, labels=full_class_labels, target_names=target_names, digits=3, output_dict=True)
     report_df = pd.DataFrame(report_dict).transpose()
-    report_df["Category"] = "Overall"
+    report_df["task"] = "Overall"
     
     # 추가적인 분석 수행 및 결과 저장
     conifer_vs_broadleaf_report = evaluate_conifer_vs_broadleaf(all_labels, all_predictions)  # 침/활 분류력
-    conifer_vs_broadleaf_report["Category"] = "Conifer vs Broadleaf"
+    conifer_vs_broadleaf_report["task"] = "Conifer vs Broadleaf"
     
     conifer_report = evaluate_conifer_classification(all_labels, all_predictions)  # 침엽수 내 분류력
-    conifer_report["Category"] = "Conifer"
+    conifer_report["task"] = "Conifer"
     
     broadleaf_report = evaluate_broadleaf_classification(all_labels, all_predictions)  # 활엽수 내 분류력
-    broadleaf_report["Category"] = "Broadleaf"
+    broadleaf_report["task"] = "Broadleaf"
     
     # 결과를 하나의 데이터프레임으로 통합
     additional_metrics = pd.concat([conifer_vs_broadleaf_report, conifer_report, broadleaf_report])
@@ -294,7 +294,9 @@ def evaluate_rf_model_with_cm(model, val_loader, num_classes=6, target_name_mapp
     return final_report_df
 
 
-#dataset class
+"""
+Dataset 클래스
+"""
 class TiffDataset(Dataset):
     def __init__(self, large_tif_dir, file_list, label_file, patch_size=3, box_filter_fn=None, transform=None):
         """
@@ -375,6 +377,30 @@ class TiffDataset(Dataset):
 
         return patch, label
 
+"""
+기본 데이터 transform
+"""
+class ReshapeTransform:
+    """(12*bands, 3, 3) → (12, bands, 3, 3) 변환"""
+    def __init__(self, bands, patch_size, time=12):
+        self.bands = bands
+        self.patch_size = patch_size
+        self.time = time
+
+    def __call__(self, x):
+        return x.view(self.bands, self.time, self.patch_size, self.patch_size)
+
+def scale_up_planet_channels(x):
+    x[:3] *= 5  # 첫 3개 채널을 5배 스케일링
+    return x
+
+def base_transform(bands, patch_size, scale_channels=True):
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.float()),  # uint16 → float 변환
+        ReshapeTransform(bands, patch_size),  # (12*bands, height, width) → (bands, time, height, width)
+        transforms.Lambda(scale_up_planet_channels)  # 첫 3개 채널을 5배 확대
+    ])
     
 #he initializer 함수
 def he_init_weights(m):
@@ -400,8 +426,14 @@ def he_init_weights(m):
         init.constant_(m.weight, 1)
         init.constant_(m.bias, 0)
 
-#sdi 함수
-def sdi_importance_analysis(model, data_loader, num_samples=1, perturbation_strength=0.2, target_dims=None):
+"""
+PSA 함수
+"""
+import torch
+import random
+from tqdm import tqdm
+
+def psa_dim(model, data_loader, num_repeats=1, perturbation_strength=0.8, target_dims=None, normalize=True, TP_only=True):
     model.eval()
 
     sample_batch, _ = next(iter(data_loader))
@@ -414,26 +446,31 @@ def sdi_importance_analysis(model, data_loader, num_samples=1, perturbation_stre
     else:
         target_dims = [f"dim_{i}" for i in target_dims]
 
-    importance_scores = {dim: 0.0 for dim in target_dims}
+    overall_scores = {dim: 0.0 for dim in target_dims}
     per_class_scores = {}
+    TP_count = {}  # TP 개수를 저장할 딕셔너리
+    total_samples = 0
 
-    num_batches = 0
-    for X_batch, _ in data_loader:
-        num_batches += 1
+    for X_batch, targets in tqdm(data_loader, desc="Processing batches"):
+        batch_size = X_batch.shape[0]
+        total_samples += batch_size
         X_batch = X_batch.to(next(model.parameters()).device)
+        targets = targets.to(X_batch.device)
 
         logit_original = model(X_batch).detach()
+        predictions = logit_original.argmax(dim=1)
         num_classes = logit_original.shape[1]
 
         if not per_class_scores:
             per_class_scores = {cls: {dim: 0.0 for dim in target_dims} for cls in range(num_classes)}
+            TP_count = {cls: 0 for cls in range(num_classes)}
 
         for dim_name in target_dims:
             dim_idx = dim_names.index(dim_name) + 1  # 1-based index
-            total_mse = 0.0
-            class_mse = {cls: 0.0 for cls in range(num_classes)}
+            total_abs_error = 0.0
+            class_abs_error = {cls: 0.0 for cls in range(num_classes)}
 
-            for _ in range(num_samples):
+            for _ in range(num_repeats):
                 X_perturbed = X_batch.clone().detach()
                 num_swap = max(1, int(X_perturbed.shape[dim_idx] * perturbation_strength))
                 swap_indices = random.sample(range(X_perturbed.shape[dim_idx]), num_swap)
@@ -443,51 +480,435 @@ def sdi_importance_analysis(model, data_loader, num_samples=1, perturbation_stre
                                         X_perturbed.index_select(dim_idx, torch.tensor(permutation, device=X_batch.device)))
 
                 logit_perturbed = model(X_perturbed).detach()
-                mse = torch.mean((logit_original - logit_perturbed) ** 2, dim=0)
-                total_mse += mse.mean().item()
+                abs_error = torch.abs(logit_original - logit_perturbed)  # 원본과 변형된 예측값의 절대 차이 계산
+
+                total_abs_error += abs_error.mean().item() * batch_size
 
                 for cls in range(num_classes):
-                    class_mse[cls] += mse[cls].item()
+                    if TP_only:
+                        TP_mask = (predictions == targets) & (targets == cls)
+                        TP_sample_count = TP_mask.sum().item()
+                        if TP_sample_count > 0:
+                            TP_count[cls] += TP_sample_count
+                            class_abs_error[cls] += abs_error[TP_mask].sum().item()  # TP 개별 샘플들의 에러 합산
+                    else:
+                        class_abs_error[cls] += abs_error[:, cls].sum().item()
 
-            importance_scores[dim_name] += total_mse / num_samples
+            overall_scores[dim_name] += total_abs_error / num_repeats
             for cls in range(num_classes):
-                per_class_scores[cls][dim_name] += class_mse[cls] / num_samples
+                per_class_scores[cls][dim_name] += class_abs_error[cls] / num_repeats
 
-    for key in importance_scores:
-        importance_scores[key] /= num_batches
+    for key in overall_scores:
+        overall_scores[key] /= total_samples
 
     for cls in per_class_scores:
-        for key in per_class_scores[cls]:
-            per_class_scores[cls][key] /= num_batches
+        if TP_only and TP_count[cls] > 0:
+            for key in per_class_scores[cls]:
+                per_class_scores[cls][key] /= TP_count[cls]  # TP 샘플 개수로 나누어 평균 계산
+        else:
+            for key in per_class_scores[cls]:
+                per_class_scores[cls][key] /= total_samples
 
     # 🔹 선택한 차원만 정규화하여 합이 1이 되도록 조정
-    total_score = sum(importance_scores.values())
-    importance_scores = {key: value / total_score for key, value in importance_scores.items()} if total_score > 0 else importance_scores
+    if normalize:
+        total_score = sum(overall_scores.values())
+        overall_scores = {key: value / total_score for key, value in overall_scores.items()} if total_score > 0 else overall_scores
 
-    for cls in per_class_scores:
-        class_total_score = sum(per_class_scores[cls].values())
-        per_class_scores[cls] = {key: value / class_total_score for key, value in per_class_scores[cls].items()} if class_total_score > 0 else per_class_scores[cls]
+        for cls in per_class_scores:
+            class_total_score = sum(per_class_scores[cls].values())
+            per_class_scores[cls] = {key: value / class_total_score for key, value in per_class_scores[cls].items()} if class_total_score > 0 else per_class_scores[cls]
 
-    return {"overall": importance_scores, "per_class": per_class_scores}
+    return {"overall": overall_scores, "per_class": per_class_scores}
 
 
-def plot_importance_scores(importance_scores, per_class_scores):
+def plot_psa_dim_scores(overall_scores, per_class_scores, dim_labels=["Bands", "Time", "Space"]):
     # Overall Dimension Importance (Bar Chart)
+    combined_scores = {
+        "Bands": overall_scores['dim_1'],
+        "Time": overall_scores['dim_2'],
+        "Space": overall_scores['dim_3'] + overall_scores['dim_4']
+    }
+
     plt.figure(figsize=(8, 5))
-    plt.bar(importance_scores.keys(), importance_scores.values(), color='skyblue')
+    plt.bar(dim_labels, combined_scores.values(), color='skyblue')
     plt.xlabel("Dimension")
-    plt.ylabel("Importance Score")
-    plt.title("Overall Dimension Importance")
+    plt.ylabel("Sensitivity Score")
+    plt.title("Overall Dimension Sensitivity")
     plt.xticks(rotation=45)
     plt.show()
 
     # Per-Class Importance (Heatmap)
-    per_class_df = {cls: list(scores.values()) for cls, scores in per_class_scores.items()}
-    dim_labels = list(per_class_scores[0].keys())  # Dimension names
-
+    per_class_df = {}
+    for cls, scores in per_class_scores.items():
+        per_class_df[target_name_mapping.get(cls, f"Class {cls}")] = [
+            scores['dim_1'],
+            scores['dim_2'],
+            scores['dim_3'] + scores['dim_4']  # Space
+        ]
+        
     plt.figure(figsize=(10, 6))
     sns.heatmap(list(per_class_df.values()), annot=True, cmap="Blues", xticklabels=dim_labels, yticklabels=list(per_class_df.keys()))
     plt.xlabel("Dimension")
     plt.ylabel("Class")
-    plt.title("Per-Class Dimension Importance")
+    plt.title("Per-Class Dimension Sensitivity")
+    plt.xticks(rotation=45)
     plt.show()
+
+
+#perturbation 관련 코드
+def psa_bands_time(model, dataloader, num_classes=6, num_repeats=1):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    band, time = 4, 12  # 데이터의 밴드 수와 시간 스텝 수
+
+    # 결과 저장 변수
+    total_sensitivity_map = torch.zeros((num_classes, band, time), device=device)
+    total_count_map = torch.zeros((num_classes, band, time), device=device)
+
+    total_band_sensitivity = torch.zeros((num_classes, band), device=device)
+    total_band_count = torch.zeros((num_classes, band), device=device)
+
+    total_time_sensitivity = torch.zeros((num_classes, time), device=device)
+    total_time_count = torch.zeros((num_classes, time), device=device)
+
+    with torch.no_grad():
+        for repeat in range(num_repeats):
+            sensitivity_map = torch.zeros((num_classes, band, time), device=device)
+            count_map = torch.zeros((num_classes, band, time), device=device)
+
+            band_sensitivity = torch.zeros((num_classes, band), device=device)
+            band_count = torch.zeros((num_classes, band), device=device)
+
+            time_sensitivity = torch.zeros((num_classes, time), device=device)
+            time_count = torch.zeros((num_classes, time), device=device)
+
+            for data, labels in tqdm(dataloader, desc=f"Experiment {repeat+1}/{num_repeats}"):
+                data, labels = data.to(device), labels.to(device)
+                B, Band, Time, H, W = data.shape
+
+                # 1. 원본 예측값 저장
+                original_logits = model(data)
+                original_preds = original_logits.argmax(dim=1)
+
+                # 2. True Positive(TP) 마스크 생성
+                tp_mask = (original_preds == labels)
+
+                # 3. band & time 개별 교란 (Zero-out)
+                for b in range(band):
+                    for t in range(time):
+                        perturbed_data = data.clone()
+                        perturbed_data[:, b, t] = 0  # 완전 무효화
+
+                        perturbed_logits = model(perturbed_data)
+                        abs_error = torch.abs(original_logits - perturbed_logits)  # 절대값 오차 계산
+
+                        for c in range(num_classes):
+                            class_mask = (original_preds == c)
+                            valid_mask = tp_mask & class_mask  # TP 중 해당 클래스 데이터 선택
+
+                            sensitivity_map[c, b, t] += abs_error[:, c][valid_mask].sum()
+                            count_map[c, b, t] += valid_mask.sum()  # TP 개수 누적
+
+                # 4. band 전체를 Zero-out하여 민감도 측정
+                for b in range(band):
+                    perturbed_data = data.clone()
+                    perturbed_data[:, b] = 0  # 완전 무효화
+
+                    perturbed_logits = model(perturbed_data)
+                    abs_error = torch.abs(original_logits - perturbed_logits)
+
+                    for c in range(num_classes):
+                        class_mask = (original_preds == c)
+                        valid_mask = tp_mask & class_mask
+
+                        band_sensitivity[c, b] += abs_error[:, c][valid_mask].sum()
+                        band_count[c, b] += valid_mask.sum()
+
+                # 5. time 전체를 Zero-out하여 민감도 측정
+                for t in range(time):
+                    perturbed_data = data.clone()
+                    perturbed_data[:, :, t] = 0  # 완전 무효화
+
+                    perturbed_logits = model(perturbed_data)
+                    abs_error = torch.abs(original_logits - perturbed_logits)
+
+                    for c in range(num_classes):
+                        class_mask = (original_preds == c)
+                        valid_mask = tp_mask & class_mask
+
+                        time_sensitivity[c, t] += abs_error[:, c][valid_mask].sum()
+                        time_count[c, t] += valid_mask.sum()
+
+            # 반복 실험 결과 누적
+            total_sensitivity_map += sensitivity_map
+            total_count_map += count_map
+
+            total_band_sensitivity += band_sensitivity
+            total_band_count += band_count
+
+            total_time_sensitivity += time_sensitivity
+            total_time_count += time_count
+
+    # **정규화 (개수로 나누기)**
+    total_sensitivity_map = torch.where(total_count_map > 0, total_sensitivity_map / total_count_map, total_sensitivity_map)
+    total_band_sensitivity = torch.where(total_band_count > 0, total_band_sensitivity / total_band_count, total_band_sensitivity)
+    total_time_sensitivity = torch.where(total_time_count > 0, total_time_sensitivity / total_time_count, total_time_sensitivity)
+
+    return (
+        total_sensitivity_map.cpu().numpy(),  # (num_classes, band, time)
+        total_band_sensitivity.cpu().numpy(),  # (num_classes, band)
+        total_time_sensitivity.cpu().numpy()  # (num_classes, time)
+    )
+
+def add_noise(data, noise_level=1.0):
+    """
+    데이터에 랜덤 노이즈를 추가하는 함수.
+
+    Args:
+        data (torch.Tensor): 입력 데이터 (Bands, Time, Height, Width)
+        noise_level (float): 노이즈 강도 계수
+
+    Returns:
+        torch.Tensor: 노이즈가 추가된 데이터
+    """
+    noise = (torch.rand_like(data) * 2 - 1) * (data * noise_level)
+    return data + noise
+
+def evaluate_perturbation(model, dataloader, num_classes=6, noise_level=0.1, num_repeats=1):
+    """
+    모델의 교란(노이즈) 영향 평가 및 중요도 히트맵 생성 (기존 + 새로운 방법 포함)
+
+    Args:
+        model (torch.nn.Module): 학습된 모델
+        dataloader (torch.utils.data.DataLoader): 데이터 로더
+        num_classes (int): 클래스 개수
+        noise_level (float): 노이즈 강도
+        num_repeats (int): 반복 실험 횟수
+
+    Returns:
+        tuple:
+            - 히트맵 (num_classes, band, time)
+            - count_map (num_classes, band, time)
+            - band별 중요도 (num_classes, band)
+            - time별 중요도 (num_classes, time)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    band, time = 4, 12  # 데이터의 밴드 수와 시간 스텝 수
+
+    # 결과 저장용 변수
+    total_heatmap = torch.zeros((num_classes, band, time), device=device)
+    total_count_map = torch.zeros((num_classes, band, time), device=device)
+    total_band_importance = torch.zeros((num_classes, band), device=device)
+    total_time_importance = torch.zeros((num_classes, time), device=device)
+
+    with torch.no_grad():
+        for repeat in range(num_repeats):
+            heatmap = torch.zeros((num_classes, band, time), device=device)
+            band_importance = torch.zeros((num_classes, band), device=device)
+            time_importance = torch.zeros((num_classes, time), device=device)
+
+            for data, labels in tqdm(dataloader, desc=f"Experiment {repeat+1}/{num_repeats}"):
+                data, labels = data.to(device), labels.to(device)
+                B, Band, Time, H, W = data.shape
+
+                # 1. 원본 예측값 저장
+                original_logits = model(data)
+                original_preds = original_logits.argmax(dim=1)
+
+                # 2. True Positive(TP) 마스크 생성
+                tp_mask = (original_preds == labels)
+
+                # 3. 기존 방법: band, time의 특정 값만 교란
+                for b in range(band):
+                    for t in range(time):
+                        perturbed_data = data.clone()
+                        perturbed_data[:, b, t] = add_noise(perturbed_data[:, b, t], noise_level)
+
+                        perturbed_logits = model(perturbed_data)
+                        mse_loss = F.mse_loss(original_logits, perturbed_logits, reduction='none').mean(dim=1)
+
+                        for c in range(num_classes):
+                            class_mask = (original_preds == c)
+                            valid_mask = tp_mask & class_mask
+                            heatmap[c, b, t] += mse_loss[valid_mask].sum()
+
+                # 4. 새로운 방법 1️⃣: band 전체를 교란하여 중요도 측정
+                for b in range(band):
+                    perturbed_data = data.clone()
+                    perturbed_data[:, b] = add_noise(perturbed_data[:, b], noise_level)
+
+                    perturbed_logits = model(perturbed_data)
+                    mse_loss = F.mse_loss(original_logits, perturbed_logits, reduction='none').mean(dim=1)
+
+                    for c in range(num_classes):
+                        class_mask = (original_preds == c)
+                        valid_mask = tp_mask & class_mask
+                        band_importance[c, b] += mse_loss[valid_mask].sum()
+
+                # 5. 새로운 방법 2️⃣: time 전체를 교란하여 중요도 측정
+                for t in range(time):
+                    perturbed_data = data.clone()
+                    perturbed_data[:, :, t] = add_noise(perturbed_data[:, :, t], noise_level)
+
+                    perturbed_logits = model(perturbed_data)
+                    mse_loss = F.mse_loss(original_logits, perturbed_logits, reduction='none').mean(dim=1)
+
+                    for c in range(num_classes):
+                        class_mask = (original_preds == c)
+                        valid_mask = tp_mask & class_mask
+                        time_importance[c, t] += mse_loss[valid_mask].sum()
+
+            # 반복 실험 결과 누적
+            total_heatmap += heatmap
+            total_band_importance += band_importance
+            total_time_importance += time_importance
+
+    # 평균 내기
+    total_heatmap /= num_repeats
+    total_band_importance /= num_repeats
+    total_time_importance /= num_repeats
+
+    # 히트맵 정규화 (기존 방식)
+    for c in range(num_classes):
+        if total_heatmap[c].sum() > 0:
+            total_heatmap[c] /= total_heatmap[c].sum()
+            total_heatmap[c] *= (band * time)
+
+    # 새로운 방식 정규화 (band, time 각각 정규화)
+    for c in range(num_classes):
+        if total_band_importance[c].sum() > 0:
+            total_band_importance[c] /= total_band_importance[c].sum()
+            total_band_importance[c] *= band
+
+        if total_time_importance[c].sum() > 0:
+            total_time_importance[c] /= total_time_importance[c].sum()
+            total_time_importance[c] *= time
+
+    return (
+        total_heatmap.cpu().numpy(),  # (num_classes, band, time)
+        total_band_importance.cpu().numpy(),  # (num_classes, band)
+        total_time_importance.cpu().numpy()  # (num_classes, time)
+    )
+
+
+def plot_psa_maps(importance_maps, band_importance, time_importance):
+    """
+    중요도 맵을 시각화하는 함수
+
+    Args:
+        importance_maps (np.array): (num_classes, num_bands, num_times) 형태의 중요도 맵
+        band_importance (np.array): (num_classes, num_bands) 밴드별 중요도 (모든 값 교란)
+        time_importance (np.array): (num_classes, num_times) 시기별 중요도 (모든 값 교란)
+    """
+    num_classes, num_bands, num_times = importance_maps.shape
+
+    # 클래스별로 3개의 그래프 (히트맵, 교란된 밴드 중요도, 교란된 시기 중요도)
+    fig, axes = plt.subplots(num_classes, 3, figsize=(18, 4 * num_classes))
+
+    for cls in range(num_classes):
+        class_name = target_name_mapping[cls]  # 클래스 이름 가져오기
+
+        # 1️⃣ 시기별 & 밴드별 중요도 히트맵
+        ax = axes[cls, 0]
+        sns.heatmap(importance_maps[cls], cmap="coolwarm", annot=True, fmt=".2f", ax=ax)
+        ax.set_title(f"{class_name}: Temporal & Band Importance")
+        ax.set_xlabel("Time (Dates)")
+        ax.set_ylabel("Bands (B, G, R, NIR)")
+        ax.set_xticks(np.arange(num_times))
+        ax.set_xticklabels(dates, rotation=45)  # 날짜 라벨 적용
+
+        # 2️⃣ 새로운 방식: 교란된 밴드별 중요도 바 그래프
+        ax = axes[cls, 1]
+        ax.bar(["B", "G", "R", "NIR"], band_importance[cls], color=["blue", "green", "red", "purple"])
+        ax.set_title(f"{class_name}: Band Importance")
+        ax.set_ylabel("Importance Score")
+
+        # 3️⃣ 새로운 방식: 교란된 시기별 중요도 바 그래프
+        ax = axes[cls, 2]
+        ax.bar(dates, time_importance[cls], color="darkorange")
+        ax.set_title(f"{class_name}: Temporal Importance")
+        ax.set_xlabel("Time (Dates)")
+        ax.set_ylabel("Importance Score")
+        ax.set_xticks(np.arange(num_times))
+        ax.set_xticklabels(dates, rotation=45)  # 날짜 라벨 적용
+
+    plt.tight_layout()
+    plt.show()
+    
+#attention 분석
+def compute_and_visualize_avg_attention(model, train_loader, num_classes, device):
+    """
+    1. TP(True Positive) 데이터 필터링
+    2. 각 클래스별 Attention Score Map 누적 (첫 번째 / 마지막 / 전체 평균)
+    3. 클래스별 평균 Attention Map 계산 후 시각화 (각 클래스당 3개)
+    """
+    model.eval()
+    num_layers = None
+
+    class_attention_first = {c: torch.zeros(12, 12).to(device) for c in range(num_classes)}
+    class_attention_last = {c: torch.zeros(12, 12).to(device) for c in range(num_classes)}
+    class_attention_avg = {c: torch.zeros(12, 12).to(device) for c in range(num_classes)}
+    
+    class_count = {c: 0 for c in range(num_classes)}
+
+    with torch.no_grad():
+        for x, y in tqdm(train_loader, desc="Processing Batches", unit="batch"):
+            x, y = x.to(device), y.to(device)
+
+            # ✅ 모델 Forward Pass (Attention Score 포함)
+            logits, attention_weights = model(x, return_attention=True)
+
+            # 🔹 attention_weights가 list인 경우 tensor로 변환
+            if isinstance(attention_weights, list):
+                attention_weights = torch.stack(attention_weights, dim=1)  # (batch, num_layers, heads, 12, 12)
+
+            predictions = torch.argmax(logits, dim=1)  # 예측값 (batch,)
+
+            if num_layers is None:
+                num_layers = attention_weights.shape[1]
+
+            # 🔹 TP 데이터 필터링 & Attention 누적
+            for i in range(len(y)):
+                true_label = y[i].item()
+                pred_label = predictions[i].item()
+
+                if true_label == pred_label:  # ✅ True Positive만 사용
+                    
+                    attn_first = attention_weights[i, 0].to(device)  # 첫 번째 레이어 평균 (12, 12)
+                    attn_last = attention_weights[i, -1].to(device)  # 마지막 레이어 평균 (12, 12)
+                    attn_avg = attention_weights[i].mean(dim=0).to(device)  # 전체 레이어 평균 (12, 12)
+                    
+                    class_attention_first[true_label] += attn_first
+                    class_attention_last[true_label] += attn_last
+                    class_attention_avg[true_label] += attn_avg
+                    class_count[true_label] += 1
+
+    # 🔹 클래스별 평균 Attention Map 계산 & 시각화
+    for c in range(num_classes):
+        if class_count[c] == 0:
+            print(f"[경고] 클래스 {target_name_mapping[c]}의 TP 데이터가 없습니다. (스킵)")
+            continue
+        
+        avg_first = class_attention_first[c] / class_count[c]
+        avg_last = class_attention_last[c] / class_count[c]
+        avg_all = class_attention_avg[c] / class_count[c]
+
+        # 🔹 시각화
+        for idx, (title, avg_attn) in enumerate([
+            (f"Class {target_name_mapping[c]} - First Layer", avg_first),
+            (f"Class {target_name_mapping[c]} - Last Layer", avg_last),
+            (f"Class {target_name_mapping[c]} - All Layers Avg", avg_all),
+        ]):
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(avg_attn.cpu().numpy(), annot=False, cmap="viridis", square=True)
+            plt.xlabel("Key Time Steps")
+            plt.ylabel("Query Time Steps")
+            plt.title(title)
+            plt.show()
+
+    print(f"✅ {num_classes * 3} 개의 평균 Attention Map이 출력되었습니다.")
