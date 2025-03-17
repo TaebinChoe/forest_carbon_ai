@@ -99,9 +99,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         val_report = classification_report(val_labels, val_predictions, labels=full_class_labels, output_dict=True)
         
-        print(f"\nEpoch [{epoch+1}/{num_epochs}], "
-              f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_report['accuracy']:.2f}, Train f1-score: {train_report["macro avg"]["f1-score"]:.2f} "
-              f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_report['accuracy']:.2f}, Val f1-score: {val_report["macro avg"]["f1-score"]:.2f}\n")
+        print(f'\nEpoch [{epoch+1}/{num_epochs}], '
+            f'Train Loss: {train_loss:.4f}, Train Accuracy: {train_report["accuracy"]:.2f}, Train f1-score: {train_report["macro avg"]["f1-score"]:.2f} '
+            f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_report["accuracy"]:.2f}, Val f1-score: {val_report["macro avg"]["f1-score"]:.2f}\n')
+
         
         # Early Stopping & Model Saving
         if best_val_f1_score < val_report["macro avg"]["f1-score"]:
@@ -397,7 +398,7 @@ class ReshapeTransform:
 
     def __call__(self, x):
         #return x.view(self.bands, self.time, self.patch_size, self.patch_size)
-        return x.view(self.time, self.bands, self.patch_size, self.patch_size).permute(1,0,2,3)
+        return x.view(self.bands, self.time, self.patch_size, self.patch_size)
 
 def scale_up_planet_channels(x):
     x[:3] *= 5  # 첫 3개 채널을 5배 스케일링
